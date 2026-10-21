@@ -1,0 +1,114 @@
+name: Qwen end-to-end benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: 'Comma-separated Ollama model tags (include quantized tags to compare quantization)'
+        required: true
+        default: 'qwen3:0.6b,qwen3:1.7b,qwen3:4b,qwen3:4b-q8_0'
+        type: string
+      contexts:
+        description: 'Context windows to test, comma-separated'
+        required: true
+        default: '512,1024,2048,4096,8192'
+        type: string
+      input_targets:
+        description: 'Approximate input token targets, comma-separated'
+        required: true
+        default: '128,512,1024,2048,4096'
+        type: string
+      output_limits:
+        description: 'Maximum output token limits, comma-separated'
+        required: true
+        default: '32,128,512'
+        type: string
+      max_cases_per_model:
+        description: 'Optional smoke-test cap (0 means all valid combinations)'
+        required: true
+        default: '0'
+        type: string
+  workflow_call:
+    inputs:
+      models: { required: false, type: string, default: 'qwen3:0.6b,qwen3:1.7b,qwen3:4b,qwen3:4b-q8_0' }
+      contexts: { required: false, type: string, default: '512,1024,2048,4096,8192' }
+      input_targets: { required: false, type: string, default: '128,512,1024,2048,4096' }
+      output_limits: { required: false, type: string, default: '32,128,512' }
+      max_cases_per_model: { required: false, type: string, default: '0' }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen-benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      MODELS: ${{ inputs.models || github.event.inputs.models }}
+      CONTEXTS: ${{ inputs.contexts || github.event.inputs.contexts }}
+      INPUT_TARGETS: ${{ inputs.input_targets || github.event.inputs.input_targets }}
+      OUTPUT_LIMITS: ${{ inputs.output_limits || github.event.inputs.output_limits }}
+      MAX_CASES: ${{ inputs.max_cases_per_model || github.event.inputs.max_cases_per_model || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+      - name: Start Ollama service
+        run: |
+          (ollama serve > ollama.log 2>&1 &)
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:11434/api/tags >/dev/null; then exit 0; fi
+            sleep 2
+          done
+          cat ollama.log
+          exit 1
+      - name: Run model and quantization matrix
+        shell: bash
+        run: |
+          mkdir -p results
+          IFS=',' read -ra MODEL_ARRAY <<< "$MODELS"
+          for raw_model in "${MODEL_ARRAY[@]}"; do
+            model="$(echo "$raw_model" | xargs)"
+            [[ -z "$model" ]] && continue
+            safe="$(echo "$model" | tr '/: ' '___' | tr -cd '[:alnum:]_.-')"
+            echo "===== Benchmarking $model ====="
+            if ! ollama pull "$model"; then
+              python - "$model" "results/${safe}.json" <<'PY'
+          import json,sys,os
+          from datetime import datetime,timezone
+          model,path=sys.argv[1:]
+          os.makedirs(os.path.dirname(path),exist_ok=True)
+          with open(path,'w') as f: json.dump({'schema_version':1,'timestamp_utc':datetime.now(timezone.utc).isoformat(),'method':'ollama','model':model,'model_info':{},'test_plan':{},'results':[{'case_id':'model_pull','status':'error','error':'ollama pull failed; check model tag availability'}]},f,indent=2)
+          PY
+              continue
+            fi
+            python scripts/bench_ollama.py \
+              --model "$model" --contexts "$CONTEXTS" \
+              --input-targets "$INPUT_TARGETS" --output-limits "$OUTPUT_LIMITS" \
+              --max-cases "$MAX_CASES" --output-json "results/${safe}.json" || true
+          done
+      - name: Generate consolidated summary
+        if: always()
+        run: python scripts/summarize_results.py --input-dir results --json-out benchmark-summary.json --md-out BENCHMARK_SUMMARY.md
+      - name: Upload all benchmark results and summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-benchmark-${{ github.run_id }}
+          path: |
+            results/
+            benchmark-summary.json
+            BENCHMARK_SUMMARY.md
+            ollama.log
+          if-no-files-found: warn
+          retention-days: 90
