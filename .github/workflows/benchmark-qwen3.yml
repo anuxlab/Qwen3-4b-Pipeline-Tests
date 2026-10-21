@@ -14,15 +14,15 @@ jobs:
           - method: "ollama"
             model_tag: "qwen3:4b"
           - method: "ollama"
-            model_tag: "qwen3:4b-q4_K_M" # If available in Ollama library
+            model_tag: "qwen3:4b-q4_K_M"
           - method: "llamacpp"
-            gguf_file: "Qwen3-4B-Q4_K_M.gguf"
+            quant: "Q4_K_M"
             gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF"
           - method: "llamacpp"
-            gguf_file: "Qwen3-4B-Q5_K_M.gguf"
+            quant: "Q5_K_M"
             gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF"
           - method: "llamacpp"
-            gguf_file: "Qwen3-4B-Q8_0.gguf"
+            quant: "Q8_0"
             gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF"
 
     steps:
@@ -33,62 +33,78 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      # ---- OLLAMA DEPENDENCIES ----
+      - name: Install Ollama-side dependencies
+        if: matrix.method == 'ollama'
+        run: pip install psutil
+
+      # ---- LLAMACPP DEPENDENCIES ----
+      - name: Install llama.cpp dependencies
+        if: matrix.method == 'llamacpp'
         run: |
           python -m pip install --upgrade pip
-          pip install requests psutil  # for ollama & general monitoring
-          pip install gh-ai-runner      # for llama.cpp variant
-          pip install huggingface_hub[cli] # for downloading GGUF
+          # llama-cpp-python has prebuilt wheels on ubuntu-latest (x86_64)
+          pip install llama-cpp-python psutil huggingface_hub
 
       # ---- OLLAMA BRANCH ----
       - name: Run Ollama Benchmark
         if: matrix.method == 'ollama'
+        id: ollama
         uses: ai-action/ollama-action@v2
         with:
           model: ${{ matrix.model_tag }}
           prompt: "Explain the significance of the Turing Test in 50 words."
           cache: true
-        id: ollama
 
-      - name: Record Ollama Response
+      - name: Write Ollama result.json
         if: matrix.method == 'ollama'
         run: |
-          echo "Ollama response length: ${#RESPONSE} chars"
-          echo "RESPONSE_LENGTH=${#RESPONSE}" >> $GITHUB_ENV
-        env:
-          RESPONSE: ${{ steps.ollama.outputs.response }}
+          RESPONSE='${{ steps.ollama.outputs.response }}'
+          cat > result.json <<EOF
+          {
+            "method": "ollama",
+            "model": "${{ matrix.model_tag }}",
+            "response_length": ${#RESPONSE},
+            "response_excerpt": "${RESPONSE:0:200}"
+          }
+          EOF
+          echo "--- result.json ---"; cat result.json
 
       # ---- LLAMA.CPP BRANCH ----
-      - name: Cache GGUF Model
+      - name: Restore GGUF cache
         if: matrix.method == 'llamacpp'
+        id: cache                       # ← CHANGE 1: required for outputs
         uses: actions/cache@v4
         with:
-          key: ${{ runner.os }}-gguf-${{ matrix.gguf_file }}-v1
+          key: ${{ runner.os }}-gguf-${{ matrix.quant }}-v1
           path: ./models
           restore-keys: |
             ${{ runner.os }}-gguf-
 
-      - name: Download GGUF (if cache miss)
+      - name: Download GGUF (cache miss)
         if: matrix.method == 'llamacpp' && steps.cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p models
-          huggingface-cli download ${{ matrix.gguf_repo }} \
-            --include "${{ matrix.gguf_file }}" \
+          # CHANGE 2: use `hf` CLI with a wildcard — resilient to filename variations
+          hf download "${{ matrix.gguf_repo }}" \
+            --include "*${{ matrix.quant }}.gguf" \
             --local-dir ./models
+          ls -lh ./models
 
-      - name: Run llama.cpp Benchmark via Python Script
+      - name: Run llama.cpp Benchmark
         if: matrix.method == 'llamacpp'
         run: |
+          # CHANGE 7 safety net: resolve actual filename
+          MODEL_FILE=$(ls ./models/*${{ matrix.quant }}.gguf | head -n1)
+          echo "Using model: $MODEL_FILE"
           python scripts/bench_llamacpp.py \
-            --model-path ./models/${{ matrix.gguf_file }} \
+            --model-path "$MODEL_FILE" \
             --prompt "Explain the significance of the Turing Test in 50 words." \
             --n-threads 4 \
             --output-json result.json
 
-      - name: Upload Benchmark Result
+      - name: Upload Benchmark Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bench-${{ matrix.method }}-${{ matrix.model_tag || matrix.gguf_file }}
-          path: |
-            result.json
-            *.log
+          name: bench-${{ matrix.method }}-${{ matrix.model_tag || matrix.quant }}
+          path: result.json
