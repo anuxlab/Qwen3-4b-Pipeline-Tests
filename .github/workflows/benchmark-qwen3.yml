@@ -1,0 +1,94 @@
+name: Benchmark Qwen3-4B Variants
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - method: "ollama"
+            model_tag: "qwen3:4b"
+          - method: "ollama"
+            model_tag: "qwen3:4b-q4_K_M" # If available in Ollama library
+          - method: "llamacpp"
+            gguf_file: "Qwen3-4B-Q4_K_M.gguf"
+            gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF"
+          - method: "llamacpp"
+            gguf_file: "Qwen3-4B-Q5_K_M.gguf"
+            gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF"
+          - method: "llamacpp"
+            gguf_file: "Qwen3-4B-Q8_0.gguf"
+            gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests psutil  # for ollama & general monitoring
+          pip install gh-ai-runner      # for llama.cpp variant
+          pip install huggingface_hub[cli] # for downloading GGUF
+
+      # ---- OLLAMA BRANCH ----
+      - name: Run Ollama Benchmark
+        if: matrix.method == 'ollama'
+        uses: ai-action/ollama-action@v2
+        with:
+          model: ${{ matrix.model_tag }}
+          prompt: "Explain the significance of the Turing Test in 50 words."
+          cache: true
+        id: ollama
+
+      - name: Record Ollama Response
+        if: matrix.method == 'ollama'
+        run: |
+          echo "Ollama response length: ${#RESPONSE} chars"
+          echo "RESPONSE_LENGTH=${#RESPONSE}" >> $GITHUB_ENV
+        env:
+          RESPONSE: ${{ steps.ollama.outputs.response }}
+
+      # ---- LLAMA.CPP BRANCH ----
+      - name: Cache GGUF Model
+        if: matrix.method == 'llamacpp'
+        uses: actions/cache@v4
+        with:
+          key: ${{ runner.os }}-gguf-${{ matrix.gguf_file }}-v1
+          path: ./models
+          restore-keys: |
+            ${{ runner.os }}-gguf-
+
+      - name: Download GGUF (if cache miss)
+        if: matrix.method == 'llamacpp' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          huggingface-cli download ${{ matrix.gguf_repo }} \
+            --include "${{ matrix.gguf_file }}" \
+            --local-dir ./models
+
+      - name: Run llama.cpp Benchmark via Python Script
+        if: matrix.method == 'llamacpp'
+        run: |
+          python scripts/bench_llamacpp.py \
+            --model-path ./models/${{ matrix.gguf_file }} \
+            --prompt "Explain the significance of the Turing Test in 50 words." \
+            --n-threads 4 \
+            --output-json result.json
+
+      - name: Upload Benchmark Result
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.method }}-${{ matrix.model_tag || matrix.gguf_file }}
+          path: |
+            result.json
+            *.log
