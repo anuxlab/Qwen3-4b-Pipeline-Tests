@@ -1,43 +1,85 @@
 import argparse, json, os, time
 import psutil
 from llama_cpp import Llama
+from prompts import get_suite
+
+def run_one(llm, p, n_ctx):
+    t0 = time.time()
+    first = None
+    text = ""
+    for chunk in llm(
+        p["prompt"],
+        max_tokens=p["max_tokens"],
+        temperature=p.get("temperature", 0.7),
+        top_p=p.get("top_p", 0.95),
+        top_k=p.get("top_k", 40),
+        repeat_penalty=p.get("repeat_penalty", 1.1),
+        echo=False,
+        stream=True,
+    ):
+        if first is None:
+            first = time.time()
+        text += chunk["choices"][0]["text"]
+    end = time.time()
+
+    prompt_tokens = len(llm.tokenize(p["prompt"].encode("utf-8")))
+    completion_tokens = len(llm.tokenize(text.encode("utf-8")))
+    gen_time = end - first if first else None
+
+    return {
+        "name": p["name"],
+        "description": p.get("description"),
+        "n_ctx": n_ctx,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "latency_sec": round(end - t0, 3),
+        "ttft_sec": round(first - t0, 3) if first else None,
+        "tokens_per_sec": round(completion_tokens / gen_time, 2) if gen_time else None,
+        "response_excerpt": text[:300],
+    }
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model-path", required=True)
-    p.add_argument("--prompt", required=True)
-    p.add_argument("--n-threads", type=int, default=4)
-    p.add_argument("--max-tokens", type=int, default=128)
-    p.add_argument("--output-json", default="result.json")
-    a = p.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model-path", required=True)
+    ap.add_argument("--suite", default="quick", choices=["quick", "full", "context"])
+    ap.add_argument("--n-ctx", type=int, default=2048)
+    ap.add_argument("--n-threads", type=int, default=4)
+    ap.add_argument("--output-json", default="result.json")
+    args = ap.parse_args()
 
-    model_path = os.path.realpath(a.model_path)
+    model_path = os.path.realpath(args.model_path)
     if not os.path.exists(model_path):
         raise FileNotFoundError(model_path)
 
     proc = psutil.Process(os.getpid())
-    mem_before = proc.memory_info().rss / 2**30          # GiB
+    llm = Llama(
+        model_path=model_path,
+        n_ctx=args.n_ctx,
+        n_threads=args.n_threads,
+        verbose=False,
+    )
 
-    t0 = time.time()
-    llm = Llama(model_path=model_path, n_threads=a.n_threads, verbose=False)
-    out = llm(a.prompt, max_tokens=a.max_tokens, echo=False)
-    latency = time.time() - t0
+    results = []
+    for p in get_suite(args.suite):
+        results.append(run_one(llm, p, args.n_ctx))
 
-    mem_after = proc.memory_info().rss / 2**30           # GiB
+    # USS AFTER inference — the truest resident footprint
+    mem_uss = proc.memory_full_info().uss / 2**30
 
-    result = {
+    payload = {
         "method": "llamacpp",
         "model": os.path.basename(model_path),
         "quant": os.path.basename(model_path).split("-")[-1].replace(".gguf", ""),
-        "latency_sec": round(latency, 3),
-        "memory_used_gb": round(mem_after - mem_before, 2),
+        "n_threads": args.n_threads,
+        "n_ctx": args.n_ctx,
+        "memory_uss_gb": round(mem_uss, 2),
         "ram_total_gb": round(psutil.virtual_memory().total / 2**30, 2),
-        "n_threads": a.n_threads,
-        "response_excerpt": out["choices"][0]["text"][:200],
+        "results": results,
     }
-    print(json.dumps(result, indent=2))
-    with open(a.output_json, "w") as f:
-        json.dump(result, f, indent=2)
+
+    print(json.dumps(payload, indent=2))
+    with open(args.output_json, "w") as f:
+        json.dump(payload, f, indent=2)
 
 if __name__ == "__main__":
     main()

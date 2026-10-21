@@ -1,8 +1,14 @@
 name: Benchmark Qwen3-4B Variants
 on:
   workflow_dispatch:
+    inputs:
+      suite:
+        description: "Prompt suite"
+        type: choice
+        options: [quick, full]
+        default: quick
   push:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
   benchmark:
@@ -11,100 +17,116 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - method: "ollama"
-            model_tag: "qwen3:4b"
-          - method: "ollama"
-            model_tag: "qwen3:4b-q4_K_M"
-          - method: "llamacpp"
-            quant: "Q4_K_M"
-            gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF"
-          - method: "llamacpp"
-            quant: "Q5_K_M"
-            gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF"
-          - method: "llamacpp"
-            quant: "Q8_0"
-            gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF"
+          - { method: ollama,   model_tag: "qwen3:4b" }
+
+          - { method: llamacpp, quant: "Q2_K",   gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF" }
+          - { method: llamacpp, quant: "Q3_K_S", gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF" }
+          - { method: llamacpp, quant: "Q3_K_M", gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF" }
+          - { method: llamacpp, quant: "Q4_K_S", gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF" }
+          - { method: llamacpp, quant: "Q4_K_M", gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF" }
+          - { method: llamacpp, quant: "Q5_K_S", gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF" }
+          - { method: llamacpp, quant: "Q5_K_M", gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF" }
+          - { method: llamacpp, quant: "Q6_K",   gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF" }
+          - { method: llamacpp, quant: "Q8_0",   gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF" }
+
+          # bf16: only on public repos (16 GB); private repos get 8 GB and will OOM
+          - { method: llamacpp, quant: "bf16",   gguf_repo: "bartowski/Qwen_Qwen3-4B-GGUF", unquantized: true }
 
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      # ---- OLLAMA DEPENDENCIES ----
-      - name: Install Ollama-side dependencies
+      # ========== OLLAMA ==========
+      - name: Setup Ollama
         if: matrix.method == 'ollama'
-        run: pip install psutil
+        uses: ai-action/setup-ollama@v2
 
-      # ---- LLAMACPP DEPENDENCIES ----
-      - name: Install llama.cpp dependencies
+      - name: Pull Ollama model
+        if: matrix.method == 'ollama'
+        run: ollama pull ${{ matrix.model_tag }}
+
+      - name: Install Ollama benchmark deps
+        if: matrix.method == 'ollama'
+        run: pip install requests psutil
+
+      - name: Run Ollama benchmark
+        if: matrix.method == 'ollama'
+        run: |
+          python scripts/bench_ollama.py \
+            --model "${{ matrix.model_tag }}" \
+            --suite "${{ github.event.inputs.suite || 'quick' }}" \
+            --n-ctx 2048 \
+            --output-json result.json
+
+      # ========== LLAMA.CPP ==========
+      - name: Install llama.cpp deps
         if: matrix.method == 'llamacpp'
-        run: |
-          python -m pip install --upgrade pip
-          # llama-cpp-python has prebuilt wheels on ubuntu-latest (x86_64)
-          pip install llama-cpp-python psutil huggingface_hub
+        run: pip install llama-cpp-python psutil huggingface_hub
 
-      # ---- OLLAMA BRANCH ----
-      - name: Run Ollama Benchmark
-        if: matrix.method == 'ollama'
-        id: ollama
-        uses: ai-action/ollama-action@v2
-        with:
-          model: ${{ matrix.model_tag }}
-          prompt: "Explain the significance of the Turing Test in 50 words."
-          cache: true
-
-      - name: Write Ollama result.json
-        if: matrix.method == 'ollama'
-        run: |
-          RESPONSE='${{ steps.ollama.outputs.response }}'
-          cat > result.json <<EOF
-          {
-            "method": "ollama",
-            "model": "${{ matrix.model_tag }}",
-            "response_length": ${#RESPONSE},
-            "response_excerpt": "${RESPONSE:0:200}"
-          }
-          EOF
-          echo "--- result.json ---"; cat result.json
-
-      # ---- LLAMA.CPP BRANCH ----
       - name: Restore GGUF cache
         if: matrix.method == 'llamacpp'
-        id: cache                       # ← CHANGE 1: required for outputs
+        id: cache
         uses: actions/cache@v4
         with:
           key: ${{ runner.os }}-gguf-${{ matrix.quant }}-v1
           path: ./models
-          restore-keys: |
-            ${{ runner.os }}-gguf-
 
-      - name: Download GGUF (cache miss)
+      - name: Download GGUF
         if: matrix.method == 'llamacpp' && steps.cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p models
-          # CHANGE 2: use `hf` CLI with a wildcard — resilient to filename variations
           hf download "${{ matrix.gguf_repo }}" \
             --include "*${{ matrix.quant }}.gguf" \
             --local-dir ./models
-          ls -lh ./models
 
-      - name: Run llama.cpp Benchmark
+      - name: Run llama.cpp benchmark
         if: matrix.method == 'llamacpp'
         run: |
-          # CHANGE 7 safety net: resolve actual filename
           MODEL_FILE=$(ls ./models/*${{ matrix.quant }}.gguf | head -n1)
-          echo "Using model: $MODEL_FILE"
           python scripts/bench_llamacpp.py \
             --model-path "$MODEL_FILE" \
-            --prompt "Explain the significance of the Turing Test in 50 words." \
+            --suite "${{ github.event.inputs.suite || 'quick' }}" \
+            --n-ctx 2048 \
             --n-threads 4 \
             --output-json result.json
 
-      - name: Upload Benchmark Artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: bench-${{ matrix.method }}-${{ matrix.model_tag || matrix.quant }}
+          path: result.json
+
+  # ========== CONTEXT SWEEP (manual only) ==========
+  context-sweep:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        n_ctx: [512, 1024, 2048, 4096, 8192]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install llama-cpp-python psutil huggingface_hub
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          key: ubuntu-gguf-Q4_K_M-v1
+          path: ./models
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          hf download "bartowski/Qwen_Qwen3-4B-GGUF" \
+            --include "*Q4_K_M.gguf" --local-dir ./models
+      - run: |
+          MODEL_FILE=$(ls ./models/*Q4_K_M.gguf | head -n1)
+          python scripts/bench_llamacpp.py \
+            --model-path "$MODEL_FILE" \
+            --suite context \
+            --n-ctx ${{ matrix.n_ctx }} \
+            --n-threads 4 \
+            --output-json result.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: context-sweep-${{ matrix.n_ctx }}
           path: result.json
