@@ -1,7 +1,10 @@
 import argparse, json, os, time
 import psutil
 from llama_cpp import Llama
-from prompts import get_suite
+try:
+    from scripts.prompts import get_suite
+except ImportError:
+    from prompts import get_suite
 
 def run_one(llm, p, n_ctx):
     t0 = time.time()
@@ -35,6 +38,9 @@ def run_one(llm, p, n_ctx):
         "latency_sec": round(end - t0, 3),
         "ttft_sec": round(first - t0, 3) if first else None,
         "tokens_per_sec": round(completion_tokens / gen_time, 2) if gen_time else None,
+        "status": "ok",
+        "kind": "llamacpp_prompt_suite",
+        "response_text": text,
         "response_excerpt": text[:300],
     }
 
@@ -67,7 +73,10 @@ def main():
     mem_uss = proc.memory_full_info().uss / 2**30
 
     payload = {
+        "schema_version": 2,
         "method": "llamacpp",
+        "model_info": {"quantization": os.path.basename(model_path).split("-")[-1].replace(".gguf", "")},
+        "runtime": {"python": __import__("platform").python_version(), "platform": __import__("platform").platform()},
         "model": os.path.basename(model_path),
         "quant": os.path.basename(model_path).split("-")[-1].replace(".gguf", ""),
         "n_threads": args.n_threads,

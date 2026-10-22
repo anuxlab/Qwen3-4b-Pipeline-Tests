@@ -1,0 +1,3 @@
+# Optional local GGUF backend; install a platform-compatible llama-cpp-python wheel first.
+-r requirements.txt
+llama-cpp-python>=0.3,<1

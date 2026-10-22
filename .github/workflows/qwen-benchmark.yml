@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       models:
-        description: 'Comma-separated Ollama model tags (include quantized tags to compare quantization)'
+        description: 'Comma-separated Ollama model tags (same base family with Q4/Q5/Q8 tags for quantization comparisons)'
         required: true
         default: 'qwen3:0.6b,qwen3:1.7b,qwen3:4b,qwen3:4b-q8_0'
         type: string
       contexts:
-        description: 'Context windows to test, comma-separated'
+        description: 'Context settings, comma-separated'
         required: true
         default: '512,1024,2048,4096,8192'
         type: string
@@ -19,12 +19,17 @@ on:
         default: '128,512,1024,2048,4096'
         type: string
       output_limits:
-        description: 'Maximum output token limits, comma-separated'
+        description: 'Maximum output tokens, comma-separated'
         required: true
         default: '32,128,512'
         type: string
+      repeats:
+        description: 'Repeated trials per case (>=2 recommended)'
+        required: true
+        default: '2'
+        type: string
       max_cases_per_model:
-        description: 'Optional smoke-test cap (0 means all valid combinations)'
+        description: 'Optional cap on matrix combinations for smoke testing; 0 means exhaustive'
         required: true
         default: '0'
         type: string
@@ -34,6 +39,7 @@ on:
       contexts: { required: false, type: string, default: '512,1024,2048,4096,8192' }
       input_targets: { required: false, type: string, default: '128,512,1024,2048,4096' }
       output_limits: { required: false, type: string, default: '32,128,512' }
+      repeats: { required: false, type: string, default: '2' }
       max_cases_per_model: { required: false, type: string, default: '0' }
 
 permissions:
@@ -52,6 +58,7 @@ jobs:
       CONTEXTS: ${{ inputs.contexts || github.event.inputs.contexts }}
       INPUT_TARGETS: ${{ inputs.input_targets || github.event.inputs.input_targets }}
       OUTPUT_LIMITS: ${{ inputs.output_limits || github.event.inputs.output_limits }}
+      REPEATS: ${{ inputs.repeats || github.event.inputs.repeats || '2' }}
       MAX_CASES: ${{ inputs.max_cases_per_model || github.event.inputs.max_cases_per_model || '0' }}
     steps:
       - uses: actions/checkout@v4
@@ -59,23 +66,36 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
+      - name: Install dependencies and test benchmark code
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m compileall -q scripts tests
+          python -m pytest -q
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh
-      - name: Start Ollama service
-        run: |
-          (ollama serve > ollama.log 2>&1 &)
-          for i in $(seq 1 60); do
-            if curl -fsS http://localhost:11434/api/tags >/dev/null; then exit 0; fi
-            sleep 2
-          done
-          cat ollama.log
-          exit 1
-      - name: Run model and quantization matrix
+      - name: Start or reuse Ollama service
         shell: bash
         run: |
           mkdir -p results
+          if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+            echo 'Ollama is already listening on port 11434; reusing it.'
+          else
+            (ollama serve > ollama.log 2>&1 &)
+          fi
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+              curl -fsS http://127.0.0.1:11434/api/version || true
+              exit 0
+            fi
+            sleep 2
+          done
+          cat ollama.log || true
+          exit 1
+      - name: Run model matrix
+        shell: bash
+        run: |
+          set +e
           IFS=',' read -ra MODEL_ARRAY <<< "$MODELS"
           for raw_model in "${MODEL_ARRAY[@]}"; do
             model="$(echo "$raw_model" | xargs)"
@@ -83,24 +103,27 @@ jobs:
             safe="$(echo "$model" | tr '/: ' '___' | tr -cd '[:alnum:]_.-')"
             echo "===== Benchmarking $model ====="
             if ! ollama pull "$model"; then
-              python - "$model" "results/${safe}.json" <<'PY'
-          import json,sys,os
+              MODEL="$model" OUT="results/${safe}.json" python - <<'PY'
+          import json,os
           from datetime import datetime,timezone
-          model,path=sys.argv[1:]
-          os.makedirs(os.path.dirname(path),exist_ok=True)
-          with open(path,'w') as f: json.dump({'schema_version':1,'timestamp_utc':datetime.now(timezone.utc).isoformat(),'method':'ollama','model':model,'model_info':{},'test_plan':{},'results':[{'case_id':'model_pull','status':'error','error':'ollama pull failed; check model tag availability'}]},f,indent=2)
+          path=os.environ['OUT']; os.makedirs(os.path.dirname(path),exist_ok=True)
+          json.dump({'schema_version':2,'timestamp_utc':datetime.now(timezone.utc).isoformat(),'method':'ollama_chat','model':os.environ['MODEL'],'model_info':{'metadata_error':'model pull failed'},'results':[{'case_id':'model_pull','kind':'setup','status':'error','error':'ollama pull failed: verify tag availability and runner network'}]},open(path,'w'),indent=2)
           PY
               continue
             fi
             python scripts/bench_ollama.py \
               --model "$model" --contexts "$CONTEXTS" \
               --input-targets "$INPUT_TARGETS" --output-limits "$OUTPUT_LIMITS" \
-              --max-cases "$MAX_CASES" --output-json "results/${safe}.json" || true
+              --repeats "$REPEATS" --max-cases "$MAX_CASES" \
+              --output-json "results/${safe}.json"
+            rc=$?
+            echo "Benchmark exit code for $model: $rc"
           done
-      - name: Generate consolidated summary
+          exit 0
+      - name: Generate consolidated report even if a model fails
         if: always()
         run: python scripts/summarize_results.py --input-dir results --json-out benchmark-summary.json --md-out BENCHMARK_SUMMARY.md
-      - name: Upload all benchmark results and summary
+      - name: Upload all raw results and summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
