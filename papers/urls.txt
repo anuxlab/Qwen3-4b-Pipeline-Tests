@@ -1,0 +1,11 @@
+# Open-access arXiv PDFs for smoke testing. One direct PDF URL per line.
+# 1. Attention Is All You Need (Transformer architecture; experiments)
+https://arxiv.org/pdf/1706.03762
+# 2. BERT: Pre-training of Deep Bidirectional Transformers (pre-training and benchmarks)
+https://arxiv.org/pdf/1810.04805
+# 3. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks (RAG; datasets and results)
+https://arxiv.org/pdf/2005.11401
+# 4. LoRA: Low-Rank Adaptation of Large Language Models (methodology and evaluations)
+https://arxiv.org/pdf/2106.09685
+# 5. Learning to Simulate: Generative Metamodeling via Quantile Regression (simulation and numerical experiments)
+https://arxiv.org/pdf/2311.17797

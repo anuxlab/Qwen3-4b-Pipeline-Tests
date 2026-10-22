@@ -55,3 +55,35 @@ def test_full_json_schema_validation():
     assert result['json_valid'] is True
     assert result['schema_valid'] is False
     assert any('year' in error for error in result['schema_errors'])
+
+
+def test_page_chunks_cover_all_pages_and_respect_budget():
+    from scripts.paper_eval import build_page_chunks
+    pages = [
+        {"page": 1, "text": "Intro " * 300},
+        {"page": 2, "text": "Methods " * 300},
+        {"page": 3, "text": "Results " * 300},
+    ]
+    chunks = build_page_chunks(pages, 2500)
+    joined = "\n".join(chunks)
+    assert len(chunks) > 1
+    assert "PDF PAGE 1" in joined and "PDF PAGE 2" in joined and "PDF PAGE 3" in joined
+    assert all(len(chunk) <= 2500 for chunk in chunks)
+
+
+def test_chunk_merge_preserves_distinct_evidence_and_simulation_flag():
+    from scripts.paper_eval import merge_partial_extractions
+    a = base_output()
+    a["title"] = "A paper"
+    a["simulation_present"] = False
+    b = base_output()
+    b["title"] = None
+    b["simulation_present"] = True
+    b["simulation_explanation"] = "The paper uses a discrete-event simulation."
+    b["datasets"] = [{"name": "Dataset Y", "role": "test", "evidence": {"page": 3, "quote": "Dataset Y is evaluated."}}]
+    merged = merge_partial_extractions([a, b])
+    assert merged["title"] == "A paper"
+    assert merged["simulation_present"] is True
+    assert "Dataset X" in [x["name"] for x in merged["datasets"]]
+    assert "Dataset Y" in [x["name"] for x in merged["datasets"]]
+    assert merged["simulation_explanation"] == "The paper uses a discrete-event simulation."

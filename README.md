@@ -78,3 +78,7 @@ The pipeline does not prove the maximum possible context length of a model, guar
 ## Real research-paper extraction evaluation
 
 The separate **Real research-paper extraction evaluation** workflow tests extraction from actual PDFs, defaulting to `qwen3:4b-q8_0`. Add papers under `papers/` or list direct PDF URLs in `papers/urls.txt`, then run `.github/workflows/real-paper-extraction-eval.yml`. It measures structured extraction, evidence quote/page integrity, schema/missing-field rates, runtime, and configurable cost estimates. Optional reviewed gold annotations under `evaluation/gold/` enable field/entity accuracy metrics. See [`README_REAL_PAPER_EVAL.md`](README_REAL_PAPER_EVAL.md) for setup and interpretation.
+
+## Real-paper extraction evaluation
+
+The repository includes a separate [real-paper extraction workflow](README_REAL_PAPER_EVAL.md) with five open-access arXiv PDF links in `papers/urls.txt`. It defaults to `qwen3:4b-q8_0`, uses bounded page-labelled chunk extraction to avoid one huge 600-second request, validates JSON/evidence, and uploads a detailed report as a GitHub Actions artifact.

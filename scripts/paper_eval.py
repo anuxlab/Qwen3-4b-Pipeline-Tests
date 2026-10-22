@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 import requests
-import fitz
+import pymupdf
 from jsonschema import Draft202012Validator
 
 DEFAULT_MODEL = "qwen3:4b-q8_0"
@@ -52,7 +52,7 @@ def sha256(path: Path) -> str:
 
 def extract_pages(pdf: Path) -> list[dict[str, Any]]:
     pages=[]
-    with fitz.open(pdf) as doc:
+    with pymupdf.open(pdf) as doc:
         for i,p in enumerate(doc):
             text=p.get_text("text", sort=True).strip()
             pages.append({"page":i+1,"text":text})
@@ -112,6 +112,118 @@ def ollama_extract(model: str, prompt_text: str, timeout: int, num_ctx: int, num
         telemetry['tokens_per_sec']=round(telemetry['completion_tokens']/(telemetry['eval_duration_ns']/1e9),3)
     return parsed,telemetry
 
+
+def build_page_chunks(pages: list[dict[str, Any]], max_chars: int) -> list[str]:
+    """Split all parsed text into bounded, page-labelled chunks without silently dropping pages."""
+    if max_chars < 1500:
+        raise ValueError("max_chars per chunk must be at least 1500")
+    units: list[str] = []
+    for page in pages:
+        text = (page.get("text") or "").strip()
+        if not text:
+            continue
+        # Split unusually long pages into segments, retaining the same one-based PDF page label.
+        if len(text) > max_chars - 40:
+            segment_size = max_chars - 80
+            for offset in range(0, len(text), segment_size):
+                segment = text[offset:offset + segment_size]
+                units.append(f"[PDF PAGE {page['page']} | TEXT SEGMENT {offset // segment_size + 1}]\n{segment}")
+        else:
+            units.append(f"[PDF PAGE {page['page']}]\n{text}")
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for unit in units:
+        if current and size + len(unit) + 2 > max_chars:
+            chunks.append("\n\n".join(current))
+            current, size = [], 0
+        current.append(unit)
+        size += len(unit) + 2
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
+
+
+def _item_key(item: Any) -> str:
+    if isinstance(item, dict):
+        primary = item.get("name") or item.get("metric") or item.get("claim") or json.dumps(item, sort_keys=True, ensure_ascii=False)
+        return normalize(primary)
+    return normalize(item)
+
+
+def merge_partial_extractions(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge chunk-level extractions; keep source evidence attached to each list item."""
+    merged: dict[str, Any] = {k: ([] if isinstance(SCHEMA["properties"].get(k), dict) and SCHEMA["properties"][k].get("type") == "array" else None)
+                              for k in SCHEMA["required"]}
+    array_keys = [k for k, spec in SCHEMA["properties"].items() if isinstance(spec, dict) and spec.get("type") == "array"]
+    scalar_keys = [k for k in SCHEMA["required"] if k not in array_keys]
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        for key in scalar_keys:
+            value = part.get(key)
+            current = merged.get(key)
+            is_empty = value is None or value == "" or (key in ("simulation_present",) and value is False)
+            current_empty = current is None or current == "" or (key == "simulation_present" and current is False)
+            if not is_empty and current_empty:
+                merged[key] = value
+            elif key == "simulation_present" and value is True:
+                merged[key] = True
+        for key in array_keys:
+            incoming = part.get(key, [])
+            if not isinstance(incoming, list):
+                continue
+            existing = merged.setdefault(key, [])
+            seen = {_item_key(x) for x in existing}
+            for item in incoming:
+                if item in (None, "", {}) or _item_key(item) in seen:
+                    continue
+                existing.append(item)
+                seen.add(_item_key(item))
+    # The requested summary has a fixed upper bound; prefer first occurrences in paper order.
+    merged["five_point_summary"] = (merged.get("five_point_summary") or [])[:5]
+    # Recompute the missing-field inventory after merging rather than trusting each partial pass.
+    core = ("title", "authors", "year", "doi", "abstract", "research_problem", "methodology_explanation")
+    merged["missing_fields"] = [k for k in core if merged.get(k) in (None, "", [])]
+    if merged.get("simulation_present") is not True:
+        merged["simulation_present"] = False
+        merged["simulation_explanation"] = None
+    return merged
+
+
+def ollama_extract_chunked(model: str, pages: list[dict[str, Any]], max_chars: int, timeout: int,
+                           num_ctx: int, num_predict: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Extract in short, bounded calls; avoid sending a whole review paper in one request."""
+    chunks = build_page_chunks(pages, max_chars)
+    if not chunks:
+        raise ValueError("No extractable page text found")
+    partials: list[dict[str, Any]] = []
+    telemetry: list[dict[str, Any]] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        prompt = (f"This is chunk {idx} of {len(chunks)} from one research paper. Extract only information supported "
+                  "by this chunk. It is expected that many fields are absent in a given chunk; use null or empty arrays. "
+                  "Do not infer missing metadata from outside knowledge. For each evidence item, quote a short exact "
+                  "contiguous passage and use the one-based PDF page label. Do not summarize the entire paper unless "
+                  "this chunk contains enough evidence. Return the full required JSON schema.\n\n" + chunk)
+        data, tel = ollama_extract(model, prompt, timeout, num_ctx, num_predict)
+        partials.append(data)
+        tel["chunk_index"] = idx
+        tel["chunk_count"] = len(chunks)
+        tel["input_chars"] = len(chunk)
+        telemetry.append(tel)
+        print(f"    [{model}] chunk {idx}/{len(chunks)} complete ({tel.get('elapsed_sec', 0):.1f}s)", flush=True)
+    merged = merge_partial_extractions(partials)
+    aggregate = {
+        "chunk_count": len(chunks),
+        "chunk_telemetry": telemetry,
+        "elapsed_sec": round(sum(x.get("elapsed_sec", 0) for x in telemetry), 4),
+        "prompt_tokens": sum(x.get("prompt_tokens") or 0 for x in telemetry),
+        "completion_tokens": sum(x.get("completion_tokens") or 0 for x in telemetry),
+        "total_duration_ns": sum(x.get("total_duration_ns") or 0 for x in telemetry),
+        "load_duration_ns": sum(x.get("load_duration_ns") or 0 for x in telemetry),
+        "done_reasons": [x.get("done_reason") for x in telemetry],
+    }
+    return merged, aggregate
 
 def judge_evidence(model: str, data: dict[str,Any], pages: list[dict[str,Any]], timeout: int, num_ctx: int) -> tuple[dict[str,Any],dict[str,Any]]:
     """Second-pass model-assisted support check; not a substitute for human adjudication."""
@@ -245,7 +357,7 @@ def main() -> int:
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--models',default=DEFAULT_MODEL,help='Comma-separated Ollama model tags; default qwen3:4b-q8_0')
     ap.add_argument('--papers-dir',default='papers'); ap.add_argument('--urls-file',default='papers/urls.txt'); ap.add_argument('--download-dir',default='work/downloaded-pdfs')
-    ap.add_argument('--max-papers',type=int,default=5); ap.add_argument('--max-chars',type=int,default=42000); ap.add_argument('--num-ctx',type=int,default=16384); ap.add_argument('--num-predict',type=int,default=4096); ap.add_argument('--timeout',type=int,default=600)
+    ap.add_argument('--max-papers',type=int,default=5); ap.add_argument('--max-chars',type=int,default=6000, help='Maximum characters per model chunk; all pages are processed across multiple calls.'); ap.add_argument('--num-ctx',type=int,default=4096); ap.add_argument('--num-predict',type=int,default=1024); ap.add_argument('--timeout',type=int,default=300, help='Timeout per bounded chunk request in seconds.'); ap.add_argument('--judge-evidence',action='store_true',help='Run an additional model-assisted claim support pass (slower and disabled by default).')
     ap.add_argument('--output-dir',default='paper-eval-results'); ap.add_argument('--gold-dir',default='evaluation/gold'); ap.add_argument('--runner-cost-per-hour',type=float,default=float(os.getenv('RUNNER_COST_PER_HOUR','0'))); ap.add_argument('--input-cost-per-million',type=float,default=float(os.getenv('INPUT_COST_PER_MILLION','0'))); ap.add_argument('--output-cost-per-million',type=float,default=float(os.getenv('OUTPUT_COST_PER_MILLION','0')))
     args=ap.parse_args()
     if not 1<=args.max_papers<=20: ap.error('--max-papers must be between 1 and 20')
@@ -255,7 +367,7 @@ def main() -> int:
     if not pdfs: print('No PDFs found. Add PDFs to papers/ or URLs to papers/urls.txt.',file=sys.stderr); return 2
     if len(pdfs)<5: print(f'NOTICE: only {len(pdfs)} PDF(s) found; recommended evaluation size is 5–20.',file=sys.stderr)
     outdir=Path(args.output_dir); outdir.mkdir(parents=True,exist_ok=True); gold_dir=Path(args.gold_dir)
-    run={"schema_version":1,"run_timestamp_utc":datetime.now(timezone.utc).isoformat(),"models":models,"pdf_count":len(pdfs),"configuration":{"max_chars_per_paper":args.max_chars,"num_ctx":args.num_ctx,"num_predict":args.num_predict,"runner_cost_per_hour":args.runner_cost_per_hour,"input_cost_per_million":args.input_cost_per_million,"output_cost_per_million":args.output_cost_per_million},"papers":[]}
+    run={"schema_version":1,"run_timestamp_utc":datetime.now(timezone.utc).isoformat(),"models":models,"pdf_count":len(pdfs),"configuration":{"max_chars_per_paper":args.max_chars,"num_ctx":args.num_ctx,"num_predict":args.num_predict,"request_timeout_sec":args.timeout,"runner_cost_per_hour":args.runner_cost_per_hour,"input_cost_per_million":args.input_cost_per_million,"output_cost_per_million":args.output_cost_per_million},"papers":[]}
     for pdf in pdfs:
         paper_started=time.perf_counter()
         try:
@@ -268,19 +380,21 @@ def main() -> int:
                     paper['models'].append({"model":model,"status":"skipped_no_text","error":"No extractable text; OCR is required before model evaluation.","wall_time_sec":0,"total_processing_sec":round(time.perf_counter()-paper_started,3)})
                 run['papers'].append(paper)
                 continue
-            prompt_text=build_prompt(pages,args.max_chars)
             preprocess_time=round(time.perf_counter()-paper_started,3)
             paper['preprocessing_time_sec']=preprocess_time
             for model in models:
                 started=time.perf_counter(); rec={"model":model}
                 try:
-                    data,tel=ollama_extract(model,prompt_text,args.timeout,args.num_ctx,args.num_predict)
+                    data,tel=ollama_extract_chunked(model,pages,args.max_chars,args.timeout,args.num_ctx,args.num_predict)
                     validation=validate_output(data,pages)
-                    try:
-                        judge_result,judge_tel=judge_evidence(model,data,pages,args.timeout,args.num_ctx)
-                    except Exception as judge_error:
-                        judge_result={"judgements":[],"support_rate":None,"items_judged":0,"note":f"Evidence judge failed: {type(judge_error).__name__}: {judge_error}"}
-                        judge_tel={"elapsed_sec":0,"prompt_tokens":0,"completion_tokens":0,"error":str(judge_error)}
+                    judge_result={"judgements":[],"support_rate":None,"items_judged":0,"note":"Disabled by default to keep extraction runs bounded; enable --judge-evidence for a slower screening pass."}
+                    judge_tel={"elapsed_sec":0,"prompt_tokens":0,"completion_tokens":0}
+                    if args.judge_evidence:
+                        try:
+                            judge_result,judge_tel=judge_evidence(model,data,pages,args.timeout,args.num_ctx)
+                        except Exception as judge_error:
+                            judge_result={"judgements":[],"support_rate":None,"items_judged":0,"note":f"Evidence judge failed: {type(judge_error).__name__}: {judge_error}"}
+                            judge_tel={"elapsed_sec":0,"prompt_tokens":0,"completion_tokens":0,"error":str(judge_error)}
                     elapsed=time.perf_counter()-started
                     gold=load_gold(gold_dir/(pdf.stem+'.json'))
                     scores=score_gold(data,gold)
@@ -289,7 +403,10 @@ def main() -> int:
                     runner_cost=(elapsed/3600)*args.runner_cost_per_hour
                     rec.update({"status":"ok","extraction":data,"validation":validation,"evidence_judgement":judge_result,"telemetry":{"extraction":tel,"evidence_judge":judge_tel,"total_prompt_tokens":prompt_tokens,"total_completion_tokens":output_tokens},"wall_time_sec":round(elapsed,3),"total_processing_sec":round(preprocess_time+elapsed,3),"estimated_model_token_cost":round(token_cost,8),"estimated_runner_cost":round(runner_cost,8),"estimated_total_cost":round(token_cost+runner_cost,8),"gold_annotation_available":gold is not None,"gold_scores":scores})
                 except Exception as e:
-                    rec.update({"status":"error","error":f"{type(e).__name__}: {e}","wall_time_sec":round(time.perf_counter()-started,3)})
+                    message=f"{type(e).__name__}: {e}"
+                    if isinstance(e, requests.exceptions.Timeout):
+                        message += ". Ollama did not finish before the request timeout; reduce max_chars/num_predict or use a faster/persistent inference host."
+                    rec.update({"status":"error","error":message,"wall_time_sec":round(time.perf_counter()-started,3)})
                 paper['models'].append(rec)
                 print(f"[{model}] {pdf.name}: {rec['status']} ({rec.get('wall_time_sec',0):.1f}s)",flush=True)
             run['papers'].append(paper)
@@ -332,7 +449,7 @@ def main() -> int:
         for r in p.get('models',[]):
             v=r.get('validation',{}); ec=v.get('evidence_checks',{})
             md.append(f"| `{p['file']}` | {p.get('page_count','—')} | `{r['model']}` | {r['status']} | {r.get('total_processing_sec',r.get('wall_time_sec','—'))} | {r.get('wall_time_sec','—')} | {r.get('estimated_total_cost','—')} | {p.get('detected_doi_regex') or '—'} | {v.get('json_valid','—')}/{v.get('schema_valid','—')} | {ec.get('quote_exact_on_page','—')}/{ec.get('total','—')} | {r.get('error','')} |")
-    md += ['', '## Accuracy and interpretation','', '- **DOI/bibliographic accuracy:** regex DOI is a candidate, not ground truth. Use `evaluation/gold/<pdf-stem>.json` to score DOI, title, year, datasets and model names.', '- **Dataset/model extraction:** gold-set precision/recall/F1 are emitted only for annotated papers.', '- **Cited-page correctness:** deterministic checks verify whether evidence quotes occur on the claimed page after whitespace normalization. A second model pass also classifies claim support against the full cited page; this is only model-assisted screening, not ground truth, and needs human review.', '- **JSON validity:** valid JSON parsing is recorded separately from required-key/schema checks.', '- **Missing fields:** report shows empty core fields and omitted required keys; some fields may genuinely be absent from a paper.', '- **Abstract, five-point summary, methodology, simulation:** these are stored in each paper/model extraction in `paper-evaluation.json`.', '- **Cost:** local Ollama model token cost defaults to zero. Configure `INPUT_COST_PER_MILLION`, `OUTPUT_COST_PER_MILLION`, and/or `RUNNER_COST_PER_HOUR` for your chosen accounting assumptions. Estimated runner cost is proportional to model wall time and does not include PDF download, model pull, or idle runner time.', '- **Scanned PDFs:** currently reported when text extraction yields no text; add OCR before treating those papers as evaluated.', '', '## Artifact files','', '- `paper-evaluation.json` — full extraction, telemetry, per-field evidence checks and optional gold scores.', '- `PAPER_EVALUATION_REPORT.md` — this report.']
+    md += ['', '## Accuracy and interpretation','', '- **DOI/bibliographic accuracy:** regex DOI is a candidate, not ground truth. Use `evaluation/gold/<pdf-stem>.json` to score DOI, title, year, datasets and model names.', '- **Dataset/model extraction:** gold-set precision/recall/F1 are emitted only for annotated papers.', '- **Cited-page correctness:** deterministic checks verify whether evidence quotes occur on the claimed page after whitespace normalization. A second model pass also classifies claim support against the full cited page; this is only model-assisted screening, not ground truth, and needs human review.', '- **JSON validity:** valid JSON parsing is recorded separately from required-key/schema checks.', '- **Missing fields:** report shows empty core fields and omitted required keys; some fields may genuinely be absent from a paper.', '- **Abstract, five-point summary, methodology, simulation:** these are stored in each paper/model extraction in `paper-evaluation.json`.', '- **Cost:** local Ollama model token cost defaults to zero. Configure `INPUT_COST_PER_MILLION`, `OUTPUT_COST_PER_MILLION`, and/or `RUNNER_COST_PER_HOUR` for your chosen accounting assumptions. Estimated runner cost is proportional to model wall time and does not include PDF download, model pull, or idle runner time.', '- **Chunked extraction:** all text-bearing pages are sent in bounded, page-labelled chunks; fields and evidence lists are merged after each chunk succeeds. A failure identifies the paper/model and chunk where it occurred.' , '- **Scanned PDFs:** currently reported when text extraction yields no text; add OCR before treating those papers as evaluated.', '', '## Artifact files','', '- `paper-evaluation.json` — full extraction, telemetry, per-field evidence checks and optional gold scores.', '- `PAPER_EVALUATION_REPORT.md` — this report.']
     (outdir/'PAPER_EVALUATION_REPORT.md').write_text('\n'.join(md)+'\n',encoding='utf-8')
     print(f"Wrote {json_path} and {outdir/'PAPER_EVALUATION_REPORT.md'}")
     return 0 if any(r.get('status')=='ok' for p in run['papers'] for r in p.get('models',[])) else 1

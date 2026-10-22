@@ -17,15 +17,32 @@ on:
       num_ctx:
         description: 'Ollama context window; raise only if runner RAM supports it.'
         required: true
-        default: '16384'
+        default: '4096'
         type: choice
-        options: ['8192','16384','24576','32768']
+        options: ['4096','8192','12288','16384']
       max_chars:
-        description: 'Maximum parsed PDF characters sent per paper.'
+        description: 'Maximum characters sent per model call; the paper is processed in page-labelled chunks.'
         required: true
-        default: '42000'
+        default: '6000'
         type: choice
-        options: ['20000','30000','42000','60000']
+        options: ['4000','6000','8000','10000']
+      num_predict:
+        description: 'Maximum generated tokens per chunk response; lower values reduce timeout risk.'
+        required: true
+        default: '1024'
+        type: choice
+        options: ['512','1024','1536','2048']
+      request_timeout_sec:
+        description: 'Timeout per Ollama request in seconds; each bounded request is capped to avoid a single huge call.'
+        required: true
+        default: '300'
+        type: choice
+        options: ['180','300','600','900']
+      judge_evidence:
+        description: 'Optional slow second-pass model review of claim support.'
+        required: true
+        default: false
+        type: boolean
       runner_cost_per_hour:
         description: 'Optional estimated runner USD/hour (0 disables runner-cost estimate).'
         required: false
@@ -108,15 +125,22 @@ jobs:
           MAX_PAPERS: ${{ inputs.max_papers }}
           NUM_CTX: ${{ inputs.num_ctx }}
           MAX_CHARS: ${{ inputs.max_chars }}
+          NUM_PREDICT: ${{ inputs.num_predict }}
+          REQUEST_TIMEOUT_SEC: ${{ inputs.request_timeout_sec }}
+          JUDGE_EVIDENCE: ${{ inputs.judge_evidence }}
           INPUT_COST_PER_MILLION: ${{ vars.INPUT_COST_PER_MILLION || '0' }}
           OUTPUT_COST_PER_MILLION: ${{ vars.OUTPUT_COST_PER_MILLION || '0' }}
         run: |
+          EXTRA_ARGS=()
+          if [[ "$JUDGE_EVIDENCE" == "true" ]]; then EXTRA_ARGS+=(--judge-evidence); fi
           python scripts/paper_eval.py \
             --models "$MODELS" \
             --max-papers "$MAX_PAPERS" \
             --num-ctx "$NUM_CTX" \
             --max-chars "$MAX_CHARS" \
-            --output-dir paper-eval-results
+            --num-predict "$NUM_PREDICT" \
+            --timeout "$REQUEST_TIMEOUT_SEC" \
+            --output-dir paper-eval-results "${EXTRA_ARGS[@]}"
       - name: Upload evaluation outputs
         if: always()
         uses: actions/upload-artifact@v4
