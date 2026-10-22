@@ -92,18 +92,3 @@ def test_summary_compacts_model_metadata():
 
 def test_summary_memory_max_stat():
     assert stat([0.2, 0.7, 0.5], "max") == 0.7
-
-
-def test_build_matrix_creates_one_entry_per_unique_model_and_safe_names():
-    from scripts.build_matrix import build_matrix
-    matrix = build_matrix('qwen3:0.6b, qwen3:4b, qwen3:0.6b, qwen3:4b-q8_0')
-    entries = matrix['include']
-    assert [x['model'] for x in entries] == ['qwen3:0.6b', 'qwen3:4b', 'qwen3:4b-q8_0']
-    assert len({x['safe_name'] for x in entries}) == len(entries)
-    assert all('/' not in x['safe_name'] and ':' not in x['safe_name'] for x in entries)
-
-def test_build_matrix_rejects_empty_model_list():
-    import pytest
-    from scripts.build_matrix import build_matrix
-    with pytest.raises(ValueError):
-        build_matrix(' , , ')

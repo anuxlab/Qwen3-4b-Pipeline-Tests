@@ -88,33 +88,18 @@ def main():
     ap.add_argument("--input-dir",default="results")
     ap.add_argument("--json-out",default="benchmark-summary.json")
     ap.add_argument("--md-out",default="BENCHMARK_SUMMARY.md")
-    ap.add_argument("--expected-models", help="Optional JSON file containing the expected model tags as a list or {'models': [...]}.")
     args=ap.parse_args()
     payloads, discovered=load_runs(args.input_dir,args.json_out)
     runs=[summarize_run(p,d) for p,d in payloads]
     records=[x for r in runs for x in r["results"]]
-    expected_models=[]
-    if args.expected_models and Path(args.expected_models).exists():
-        try:
-            expected_data=json.loads(Path(args.expected_models).read_text(encoding="utf-8"))
-            expected_models=expected_data if isinstance(expected_data,list) else expected_data.get("models", [])
-            expected_models=sorted({str(x) for x in expected_models})
-        except (OSError, json.JSONDecodeError, AttributeError):
-            expected_models=[]
-    actual_models=sorted({str(r.get("model", "unknown")) for r in runs})
-    missing_models=sorted(set(expected_models)-set(actual_models))
-    unexpected_models=sorted(set(actual_models)-set(expected_models)) if expected_models else []
-    summary={"schema_version":3,"generated_at_utc":datetime.now(timezone.utc).isoformat(),"files_discovered":discovered,
-      "expected_models":expected_models,"actual_models":actual_models,"missing_models":missing_models,"unexpected_models":unexpected_models,
-      "coverage_complete":not missing_models if expected_models else None,
+    summary={"schema_version":2,"generated_at_utc":datetime.now(timezone.utc).isoformat(),"files_discovered":discovered,
       "benchmark_runs":len(runs),"overall":{"records":len(records),"successes":sum(r["successes"] for r in runs),
       "failures":sum(r["failures"] for r in runs),"skipped":sum(r["skipped"] for r in runs)},"runs":runs}
     Path(args.json_out).parent.mkdir(parents=True,exist_ok=True)
     Path(args.json_out).write_text(json.dumps(summary,indent=2,ensure_ascii=False),encoding="utf-8")
     lines=["# Qwen End-to-End Benchmark Report","",f"Generated UTC: {summary['generated_at_utc']}","",
       "> A successful HTTP request is not proof of useful model quality. Input targets are heuristic; prompt token counts are server-reported. Compare models only on matched hardware, model revisions, prompts, context, and repetitions.","",
-      "## Executive summary","",f"- Expected model variants: **{len(expected_models) if expected_models else 'not specified'}**",f"- Model variants with results: **{len(actual_models)}**",f"- Missing model variants: **{len(missing_models)}**",f"- Coverage complete: **{summary['coverage_complete'] if summary['coverage_complete'] is not None else 'not checked'}**",f"- Model runs: **{summary['benchmark_runs']}**",f"- Result records: **{summary['overall']['records']}**",f"- Successful requests: **{summary['overall']['successes']}**",f"- Errors: **{summary['overall']['failures']}**",f"- Skipped cases: **{summary['overall']['skipped']}**","",
-      "## Matrix coverage","", *( [f"- Missing model variants: {', '.join(missing_models)}"] if missing_models else ["- No expected model variants are missing from the collected result files." if expected_models else "- Expected-model coverage was not supplied to the report generator."] ), "",
+      "## Executive summary","",f"- Model runs: **{summary['benchmark_runs']}**",f"- Result records: **{summary['overall']['records']}**",f"- Successful requests: **{summary['overall']['successes']}**",f"- Errors: **{summary['overall']['failures']}**",f"- Skipped cases: **{summary['overall']['skipped']}**","",
       "## Configuration comparison","",*md_table(runs,["model","parameter_size","quantization","successes","failures","latency_median_sec","latency_p95_sec","generation_tps_median","quality_accuracy","position_retrieval_accuracy","sentinel_accuracy"],["Model","Params","Quant","OK","Errors","Median latency s","P95 latency s","Median tok/s","Quality accuracy","Position retrieval","Sentinel accuracy"]),"",
       "## Sentinel retrieval by context and output cap","",
       "A short output cap can be exhausted by reasoning before a final answer is emitted. Read these scores alongside completion length and finish reason.","",

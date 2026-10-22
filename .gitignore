@@ -6,3 +6,6 @@ results/*.json
 benchmark-summary.json
 BENCHMARK_SUMMARY.md
 ollama.log
+paper-eval-results/
+work/
+ollama-paper-eval.log

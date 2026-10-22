@@ -19,23 +19,13 @@ A reproducible GitHub Actions benchmark for Qwen models served by Ollama. It tes
 - **Memory telemetry:** best-effort Ollama server/runner RSS and USS snapshots after requests; these are not guaranteed peak measurements.
 - **Workflow status:** raw results and reports are uploaded even when a model fails, then the workflow is marked failed so problems are not silently hidden.
 
-## Parallel GitHub Actions architecture
-
-The workflow uses a dynamic matrix with **one model tag per runner**. The `prepare` job validates the code and emits a safe matrix; every `benchmark` matrix job pulls and tests only its assigned model; the `aggregate` job downloads all per-model artifacts and writes one combined report. Matrix jobs use `fail-fast: false`, so one unavailable model does not cancel the remaining variants. The final aggregation still runs after model failures, records failed pulls as JSON, checks expected-versus-collected model coverage, uploads the consolidated report, and then fails the overall run if a model job failed or results are missing.
-
-GitHub starts matrix jobs concurrently subject to the concurrency limits of your repository/account. No `max-parallel` cap is set in the workflow, so all model variants are eligible to run at once. Each model runner is a separate hosted VM; this avoids multiple model variants competing for RAM/CPU on the same runner. The test cases for one model remain sequential by design to reduce self-contention and keep latency measurements more comparable.
-
-Artifacts:
-- `qwen-model-<run_id>-<model_slug>` — raw JSON and runner-specific Ollama log for one model.
-- `qwen-benchmark-summary-<run_id>` — all collected raw results plus `BENCHMARK_SUMMARY.md` and `benchmark-summary.json`.
-
 ## Run in GitHub Actions
 
 1. Push the repository to GitHub.
 2. Go to **Actions → Qwen end-to-end benchmark → Run workflow**.
 3. Start with a smoke run: set `max_cases_per_model` to `3`, contexts to `512,1024`, input targets to `128,256`, output limits to `32,64`, and repeats to `1`.
 4. For a full run, use the defaults or customize the model list. Include available tags for each quantization you want to compare; confirm model tags in the Ollama library first.
-5. Download `qwen-benchmark-summary-<run_id>` and open `BENCHMARK_SUMMARY.md`. It includes the combined JSON summary, expected model list, and all per-model raw results. Individual model artifacts are also available for debugging.
+5. Download the `qwen-benchmark-<run_id>` artifact and open `BENCHMARK_SUMMARY.md`. The JSON summary and raw per-model results are included.
 
 The full default Cartesian matrix can be expensive. Each matrix combination is repeated (2 by default), and a separate quality suite is also run for each model. Increase workflow timeout or reduce the matrix when needed.
 
@@ -75,8 +65,7 @@ For an optional local GGUF test, install `requirements-llamacpp.txt` in a compat
 
 ## Files
 
-- `.github/workflows/qwen-benchmark.yml` — dynamic one-model-per-runner matrix and final aggregation.
-- `scripts/build_matrix.py` — validates and expands the comma-separated model list into safe matrix entries.
+- `.github/workflows/qwen-benchmark.yml` — manual and reusable workflow.
 - `scripts/bench_ollama.py` — test matrix, API interaction, telemetry and quality checks.
 - `scripts/summarize_results.py` — consolidated Markdown and JSON summary.
 - `scripts/bench_llamacpp.py` + `scripts/prompts.py` — optional local GGUF benchmark backend (not used by the hosted Ollama workflow); install `requirements-llamacpp.txt` first.
@@ -85,3 +74,7 @@ For an optional local GGUF test, install `requirements-llamacpp.txt` in a compat
 ## What this does not claim
 
 The pipeline does not prove the maximum possible context length of a model, guarantee a full input was attended to, or establish a universal best Qwen variant. It reports the largest **tested and observed** conditions. A stronger context-window study should include position-sensitive retrieval (beginning/middle/end), needle-in-a-haystack distractors, multi-needle questions, and a verified model tokenizer.
+
+## Real research-paper extraction evaluation
+
+The separate **Real research-paper extraction evaluation** workflow tests extraction from actual PDFs, defaulting to `qwen3:4b-q8_0`. Add papers under `papers/` or list direct PDF URLs in `papers/urls.txt`, then run `.github/workflows/real-paper-extraction-eval.yml`. It measures structured extraction, evidence quote/page integrity, schema/missing-field rates, runtime, and configurable cost estimates. Optional reviewed gold annotations under `evaluation/gold/` enable field/entity accuracy metrics. See [`README_REAL_PAPER_EVAL.md`](README_REAL_PAPER_EVAL.md) for setup and interpretation.

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       models:
-        description: 'Comma-separated Ollama model tags; each tag runs on its own matrix runner'
+        description: 'Comma-separated Ollama model tags (same base family with Q4/Q5/Q8 tags for quantization comparisons)'
         required: true
         default: 'qwen3:0.6b,qwen3:1.7b,qwen3:4b,qwen3:4b-q8_0'
         type: string
@@ -50,58 +50,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: Prepare model matrix
+  benchmark:
     runs-on: ubuntu-24.04
-    outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-      models: ${{ steps.matrix.outputs.models }}
+    timeout-minutes: 360
+    env:
+      MODELS: ${{ inputs.models || github.event.inputs.models }}
+      CONTEXTS: ${{ inputs.contexts || github.event.inputs.contexts }}
+      INPUT_TARGETS: ${{ inputs.input_targets || github.event.inputs.input_targets }}
+      OUTPUT_LIMITS: ${{ inputs.output_limits || github.event.inputs.output_limits }}
+      REPEATS: ${{ inputs.repeats || github.event.inputs.repeats || '2' }}
+      MAX_CASES: ${{ inputs.max_cases_per_model || github.event.inputs.max_cases_per_model || '0' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
-      - name: Validate code before scheduling model jobs
+      - name: Install dependencies and test benchmark code
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m compileall -q scripts tests
           python -m pytest -q
-      - id: matrix
-        name: Build one-runner-per-model matrix
-        env:
-          MODELS: ${{ inputs.models || 'qwen3:0.6b,qwen3:1.7b,qwen3:4b,qwen3:4b-q8_0' }}
-        run: python scripts/build_matrix.py --models "$MODELS" --output "$GITHUB_OUTPUT"
-
-  benchmark:
-    name: Benchmark ${{ matrix.model }}
-    needs: prepare
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      # GitHub schedules each matrix entry on a separate runner. Omit max-parallel
-      # so all variants can run concurrently, subject to repository/account limits.
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    env:
-      MODEL: ${{ matrix.model }}
-      SAFE_MODEL: ${{ matrix.safe_name }}
-      CONTEXTS: ${{ inputs.contexts || '512,1024,2048,4096,8192' }}
-      INPUT_TARGETS: ${{ inputs.input_targets || '128,512,1024,2048,4096' }}
-      OUTPUT_LIMITS: ${{ inputs.output_limits || '32,128,512' }}
-      REPEATS: ${{ inputs.repeats || '2' }}
-      MAX_CASES: ${{ inputs.max_cases_per_model || '0' }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-      - name: Install runtime dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install 'requests>=2.31,<3' 'psutil>=5.9,<7'
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh
       - name: Start or reuse Ollama service
@@ -122,137 +92,59 @@ jobs:
           done
           cat ollama.log || true
           exit 1
-      - name: Pull and benchmark this model only
-        id: run_model
+      - name: Run model matrix
         shell: bash
         run: |
           set +e
-          echo "This runner is assigned to exactly one model: $MODEL"
-          ollama pull "$MODEL"
-          pull_rc=$?
-          if [[ "$pull_rc" -ne 0 ]]; then
-            MODEL="$MODEL" OUT="results/${SAFE_MODEL}.json" python - <<'PY'
-          import json, os
-          from datetime import datetime, timezone
-          payload = {'schema_version': 3, 'timestamp_utc': datetime.now(timezone.utc).isoformat(),
-                     'method': 'ollama_chat', 'model': os.environ['MODEL'],
-                     'model_info': {'metadata_error': 'model pull failed'},
-                     'results': [{'case_id': 'model_pull', 'kind': 'setup', 'status': 'error',
-                                  'error': 'ollama pull failed: verify model tag and runner network'}]}
-          with open(os.environ['OUT'], 'w', encoding='utf-8') as f:
-              json.dump(payload, f, indent=2)
+          failed=0
+          IFS=',' read -ra MODEL_ARRAY <<< "$MODELS"
+          for raw_model in "${MODEL_ARRAY[@]}"; do
+            model="$(echo "$raw_model" | xargs)"
+            [[ -z "$model" ]] && continue
+            safe="$(echo "$model" | tr '/: ' '___' | tr -cd '[:alnum:]_.-')"
+            echo "===== Benchmarking $model ====="
+            if ! ollama pull "$model"; then
+              MODEL="$model" OUT="results/${safe}.json" python - <<'PY'
+          import json,os
+          from datetime import datetime,timezone
+          path=os.environ['OUT']; os.makedirs(os.path.dirname(path),exist_ok=True)
+          json.dump({'schema_version':2,'timestamp_utc':datetime.now(timezone.utc).isoformat(),'method':'ollama_chat','model':os.environ['MODEL'],'model_info':{'metadata_error':'model pull failed'},'results':[{'case_id':'model_pull','kind':'setup','status':'error','error':'ollama pull failed: verify tag availability and runner network'}]},open(path,'w'),indent=2)
           PY
-            echo 'failed=true' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          python scripts/bench_ollama.py \
-            --model "$MODEL" --contexts "$CONTEXTS" \
-            --input-targets "$INPUT_TARGETS" --output-limits "$OUTPUT_LIMITS" \
-            --repeats "$REPEATS" --max-cases "$MAX_CASES" \
-            --output-json "results/${SAFE_MODEL}.json"
-          rc=$?
-          if [[ "$rc" -ne 0 ]]; then
-            echo "Benchmark runner exited with code $rc"
-            if [[ ! -s "results/${SAFE_MODEL}.json" ]]; then
-              MODEL="$MODEL" OUT="results/${SAFE_MODEL}.json" RC="$rc" python - <<'PY'
-          import json, os
-          from datetime import datetime, timezone
-          payload = {'schema_version': 3, 'timestamp_utc': datetime.now(timezone.utc).isoformat(),
-                     'method': 'ollama_chat', 'model': os.environ['MODEL'], 'model_info': {},
-                     'results': [{'case_id': 'benchmark_process', 'kind': 'setup', 'status': 'error',
-                                  'error': 'benchmark process failed with exit code ' + os.environ['RC']}]}
-          with open(os.environ['OUT'], 'w', encoding='utf-8') as f:
-              json.dump(payload, f, indent=2)
-          PY
+              failed=1
+              continue
             fi
-            echo 'failed=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'failed=false' >> "$GITHUB_OUTPUT"
-          fi
+            python scripts/bench_ollama.py \
+              --model "$model" --contexts "$CONTEXTS" \
+              --input-targets "$INPUT_TARGETS" --output-limits "$OUTPUT_LIMITS" \
+              --repeats "$REPEATS" --max-cases "$MAX_CASES" \
+              --output-json "results/${safe}.json"
+            rc=$?
+            echo "Benchmark exit code for $model: $rc"
+            if [[ "$rc" -ne 0 ]]; then failed=1; fi
+          done
+          echo "$failed" > .benchmark_exit_status
+          # Always continue to report generation and artifact upload; fail the job afterward.
           exit 0
-      - name: Collect runner diagnostics
+      - name: Generate consolidated report even if a model fails
+        if: always()
+        run: python scripts/summarize_results.py --input-dir results --json-out benchmark-summary.json --md-out BENCHMARK_SUMMARY.md
+      - name: Upload all raw results and summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-benchmark-${{ github.run_id }}
+          path: |
+            results/
+            benchmark-summary.json
+            BENCHMARK_SUMMARY.md
+            ollama.log
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Mark workflow failed if any model failed
         if: always()
         shell: bash
         run: |
-          mkdir -p results
-          if [[ -f ollama.log ]]; then cp ollama.log "results/${SAFE_MODEL}.ollama.log"; fi
-      - name: Upload this model's raw results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: qwen-model-${{ github.run_id }}-${{ matrix.safe_name }}
-          path: |
-            results/${{ matrix.safe_name }}.json
-            results/${{ matrix.safe_name }}.ollama.log
-          if-no-files-found: warn
-          retention-days: 90
-      - name: Mark this model job failed if pull or benchmark failed
-        if: always() && steps.run_model.outputs.failed == 'true'
-        run: exit 1
-
-  aggregate:
-    name: Aggregate all model results
-    needs: [prepare, benchmark]
-    if: always() && needs.prepare.result == 'success'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install report dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      - name: Download every model artifact
-        uses: actions/download-artifact@v4
-        with:
-          pattern: qwen-model-${{ github.run_id }}-*
-          path: results
-          merge-multiple: true
-      - name: Record expected model variants
-        env:
-          EXPECTED_MODELS: ${{ needs.prepare.outputs.models }}
-        run: |
-          python - <<'PY'
-          import json, os
-          models = json.loads(os.environ['EXPECTED_MODELS'])
-          with open('expected-models.json', 'w', encoding='utf-8') as f:
-              json.dump({'models': models}, f, indent=2)
-          print(f'Expected {len(models)} model result files: {models}')
-          PY
-      - name: Generate consolidated Markdown and JSON summary
-        if: always()
-        run: |
-          python scripts/summarize_results.py \
-            --input-dir results \
-            --expected-models expected-models.json \
-            --json-out benchmark-summary.json \
-            --md-out BENCHMARK_SUMMARY.md
-      - name: Upload consolidated report and all collected results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: qwen-benchmark-summary-${{ github.run_id }}
-          path: |
-            results/
-            expected-models.json
-            benchmark-summary.json
-            BENCHMARK_SUMMARY.md
-          if-no-files-found: warn
-          retention-days: 90
-      - name: Fail aggregate job if any model failed or result is missing
-        if: always()
-        env:
-          BENCHMARK_RESULT: ${{ needs.benchmark.result }}
-        run: |
-          python - <<'PY'
-          import json, os, sys
-          summary = json.load(open('benchmark-summary.json', encoding='utf-8')) if os.path.exists('benchmark-summary.json') else {}
-          bad = os.environ.get('BENCHMARK_RESULT') != 'success' or bool(summary.get('missing_models'))
-          if bad:
-              print('At least one model job failed or expected model results are missing.')
-              print('Missing models:', summary.get('missing_models', []))
-              sys.exit(1)
-          print('All expected model variants produced result files.')
-          PY
+          if [[ -f .benchmark_exit_status ]] && [[ "$(cat .benchmark_exit_status)" == "1" ]]; then
+            echo "One or more model pulls/benchmarks failed. See raw results and BENCHMARK_SUMMARY.md."
+            exit 1
+          fi

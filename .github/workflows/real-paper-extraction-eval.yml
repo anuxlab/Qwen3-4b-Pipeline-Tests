@@ -1,0 +1,129 @@
+name: Real research-paper extraction evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: 'Comma-separated Ollama model tags. Default is Qwen3 4B Q8; alternatives include qwen3:1.7b,qwen3:0.6b,qwen3:4b.'
+        required: true
+        default: 'qwen3:4b-q8_0'
+        type: string
+      max_papers:
+        description: 'Maximum number of PDFs to evaluate (1–20; use 5–20 for a useful sample).'
+        required: true
+        default: '5'
+        type: choice
+        options: ['5','10','15','20']
+      num_ctx:
+        description: 'Ollama context window; raise only if runner RAM supports it.'
+        required: true
+        default: '16384'
+        type: choice
+        options: ['8192','16384','24576','32768']
+      max_chars:
+        description: 'Maximum parsed PDF characters sent per paper.'
+        required: true
+        default: '42000'
+        type: choice
+        options: ['20000','30000','42000','60000']
+      runner_cost_per_hour:
+        description: 'Optional estimated runner USD/hour (0 disables runner-cost estimate).'
+        required: false
+        default: '0'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: real-paper-eval-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      OLLAMA_HOST: 127.0.0.1:11434
+      OLLAMA_BASE_URL: http://127.0.0.1:11434
+      RUNNER_COST_PER_HOUR: ${{ inputs.runner_cost_per_hour || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-paper-eval.txt
+      - name: Install dependencies and run offline tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-paper-eval.txt
+          python -m compileall -q scripts tests
+          PYTHONPATH=. python -m pytest -q
+      - name: Check paper inputs
+        shell: bash
+        run: |
+          mkdir -p papers paper-eval-results work/downloaded-pdfs
+          echo 'PDF files in papers/:'
+          find papers -maxdepth 1 -type f -iname '*.pdf' -print || true
+          if [[ ! -f papers/urls.txt ]] && ! find papers -maxdepth 1 -type f -iname '*.pdf' | grep -q .; then
+            echo 'No PDF inputs found. Add 5–20 PDFs under papers/ or create papers/urls.txt with direct PDF URLs.'
+            exit 1
+          fi
+      - name: Restore Ollama model cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-${{ runner.os }}-${{ inputs.models }}-paper-eval-v1
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | OLLAMA_NO_SYSTEMD=1 sh
+          ollama --version
+      - name: Start Ollama service
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.ollama/models"
+          ollama serve > ollama-paper-eval.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then exit 0; fi
+            sleep 2
+          done
+          cat ollama-paper-eval.log || true
+          exit 1
+      - name: Pull selected models
+        shell: bash
+        env:
+          MODELS: ${{ inputs.models }}
+        run: |
+          IFS=',' read -ra MODEL_ARRAY <<< "$MODELS"
+          for raw in "${MODEL_ARRAY[@]}"; do
+            model="$(echo "$raw" | xargs)"
+            [[ -z "$model" ]] && continue
+            echo "Pulling $model"
+            ollama pull "$model"
+          done
+      - name: Run real-paper extraction evaluation
+        env:
+          MODELS: ${{ inputs.models }}
+          MAX_PAPERS: ${{ inputs.max_papers }}
+          NUM_CTX: ${{ inputs.num_ctx }}
+          MAX_CHARS: ${{ inputs.max_chars }}
+          INPUT_COST_PER_MILLION: ${{ vars.INPUT_COST_PER_MILLION || '0' }}
+          OUTPUT_COST_PER_MILLION: ${{ vars.OUTPUT_COST_PER_MILLION || '0' }}
+        run: |
+          python scripts/paper_eval.py \
+            --models "$MODELS" \
+            --max-papers "$MAX_PAPERS" \
+            --num-ctx "$NUM_CTX" \
+            --max-chars "$MAX_CHARS" \
+            --output-dir paper-eval-results
+      - name: Upload evaluation outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-paper-extraction-eval-${{ github.run_id }}
+          path: |
+            paper-eval-results/
+            ollama-paper-eval.log
+          if-no-files-found: warn
+          retention-days: 90
