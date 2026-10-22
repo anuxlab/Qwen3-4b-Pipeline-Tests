@@ -74,13 +74,65 @@ def make_position_prompt(target_tokens: int, position: str) -> tuple[str, str]:
 
 
 def extract_answer(data: dict[str, Any]) -> tuple[str, str | None]:
-    """Handle current Ollama /api/chat response and legacy /api/generate response."""
+    """Extract user-facing answer across Ollama versions and Qwen think-tag formats.
+
+    Ollama versions/models may return reasoning in ``message.thinking``, or embed
+    <think>...</think> inside ``message.content``. Never score an unfinished
+    think-only response as the final answer.
+    """
+    import re
     message = data.get("message") or {}
     content = message.get("content")
     if content is None:
         content = data.get("response", "")
-    thinking = message.get("thinking") or data.get("thinking") or ""
-    return str(content or "").strip(), (str(thinking).strip() or None)
+    raw_content = str(content or "").strip()
+    thinking_parts = [str(message.get("thinking") or data.get("thinking") or "").strip()]
+    # Pull complete thinking blocks out of content, retaining the text after </think>.
+    block_pattern = re.compile(r"<think>(.*?)</think>", flags=re.I | re.S)
+    thinking_parts.extend(x.strip() for x in block_pattern.findall(raw_content) if x.strip())
+    cleaned = block_pattern.sub("", raw_content).strip()
+    # An open <think> with no closing tag means the output cap likely interrupted
+    # reasoning before a user-facing answer was produced.
+    if re.search(r"<think>", cleaned, flags=re.I) and not re.search(r"</think>", raw_content, flags=re.I):
+        open_thought = re.split(r"<think>", cleaned, maxsplit=1, flags=re.I)[-1].strip()
+        if open_thought:
+            thinking_parts.append(open_thought)
+        cleaned = ""
+    # Some templates put the final answer after an explicit </think> delimiter.
+    if "</think>" in raw_content.lower():
+        idx = raw_content.lower().rfind("</think>")
+        tail = raw_content[idx + len("</think>"):].strip()
+        if tail:
+            cleaned = tail
+    thinking = "\\n".join(x for x in thinking_parts if x).strip() or None
+    return cleaned, thinking
+
+
+
+
+def ollama_process_memory() -> dict[str, float | None]:
+    """Best-effort memory snapshot for Ollama server/runner processes, not Python itself."""
+    rss = 0
+    uss = 0
+    matched = False
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            cmdline = " ".join(proc.info.get("cmdline") or []).lower()
+            if not (name.startswith("ollama") or "ollama runner" in cmdline or "ollama serve" in cmdline):
+                continue
+            matched = True
+            rss += proc.memory_info().rss
+            try:
+                uss += proc.memory_full_info().uss
+            except (psutil.AccessDenied, AttributeError, OSError):
+                pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+    return {
+        "ollama_process_rss_gb": round(rss / 2**30, 3) if matched else None,
+        "ollama_process_uss_gb": round(uss / 2**30, 3) if matched and uss else None,
+    }
 
 
 def generate(model: str, prompt: str, ctx: int, output_cap: int, timeout: int) -> dict[str, Any]:
@@ -119,6 +171,10 @@ def generate(model: str, prompt: str, ctx: int, output_cap: int, timeout: int) -
         "output_cap_reached": completion_count >= output_cap,
         "answer_text": answer, "thinking_present": bool(thinking),
         "response_excerpt": answer[:300],
+        "raw_content_excerpt": str((data.get("message") or {}).get("content") or data.get("response") or "")[:500],
+        "thinking_excerpt": (thinking or "")[:500] or None,
+        "answer_status": "final_answer_present" if answer else "thinking_only_or_empty",
+        **ollama_process_memory(),
         "ollama_total_duration_sec": round(int(data.get("total_duration") or 0) / 1e9, 4) or None,
     }
 

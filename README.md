@@ -10,13 +10,24 @@ A reproducible GitHub Actions benchmark for Qwen models served by Ollama. It tes
 - **Matrix sweep:** context settings × approximate input targets × output caps, with invalid estimated budgets skipped explicitly.
 - **Repeated trials:** median and p95 latency and median/mean throughput in the summary.
 - **Prompt and generation telemetry:** actual server-reported prompt/completion tokens, prompt evaluation duration, generation duration, load time, throughput, finish reason, output-cap hit, and context utilization.
-- **Answer extraction:** uses Ollama `/api/chat` `message.content`, with legacy `/api/generate` fallback. Sends `think: false` to supported Ollama/Qwen versions so thinking content is not mistaken for the final answer.
+- **Answer extraction:** uses Ollama `/api/chat` `message.content`, with legacy `/api/generate` fallback. Sends `think: false` where supported, separates explicit `<think>...</think>` blocks, and flags empty final answers / thinking-only truncations.
 - **Quality smoke suite:** capital exact-match, bat-and-ball reasoning, structured output, JSON validity/equality, and a short long-context retrieval check.
-- **Position-sensitive retrieval:** beginning/middle/end needle probes at a high requested context/input setting to help detect position-dependent retrieval failures.
 - **Position-sensitive retrieval:** beginning/middle/end needle probes at a high requested context/input setting to help detect position-dependent retrieval failures.
 - **Output-cap probes:** sustained-generation prompts for each configured output cap; records whether the cap was respected and whether generation likely hit it.
 - **Reliability:** errors and skipped context budgets are retained in the result file; one missing model tag does not erase other results.
-- **Consolidated report:** model metadata, success/failure counts, quantization, median/p95 latency, throughput, quality score, sentinel score, and full raw case results in JSON.
+- **Consolidated report:** compact model metadata (avoids dumping full Modelfiles into Markdown), per-task quality, retrieval accuracy by context/output cap, failure snippets, empty-answer counts, and full raw case results in JSON.
+- **Memory telemetry:** best-effort Ollama server/runner RSS and USS snapshots after requests; these are not guaranteed peak measurements.
+- **Workflow status:** raw results and reports are uploaded even when a model fails, then the workflow is marked failed so problems are not silently hidden.
+
+## Parallel GitHub Actions architecture
+
+The workflow uses a dynamic matrix with **one model tag per runner**. The `prepare` job validates the code and emits a safe matrix; every `benchmark` matrix job pulls and tests only its assigned model; the `aggregate` job downloads all per-model artifacts and writes one combined report. Matrix jobs use `fail-fast: false`, so one unavailable model does not cancel the remaining variants. The final aggregation still runs after model failures, records failed pulls as JSON, checks expected-versus-collected model coverage, uploads the consolidated report, and then fails the overall run if a model job failed or results are missing.
+
+GitHub starts matrix jobs concurrently subject to the concurrency limits of your repository/account. No `max-parallel` cap is set in the workflow, so all model variants are eligible to run at once. Each model runner is a separate hosted VM; this avoids multiple model variants competing for RAM/CPU on the same runner. The test cases for one model remain sequential by design to reduce self-contention and keep latency measurements more comparable.
+
+Artifacts:
+- `qwen-model-<run_id>-<model_slug>` — raw JSON and runner-specific Ollama log for one model.
+- `qwen-benchmark-summary-<run_id>` — all collected raw results plus `BENCHMARK_SUMMARY.md` and `benchmark-summary.json`.
 
 ## Run in GitHub Actions
 
@@ -24,7 +35,7 @@ A reproducible GitHub Actions benchmark for Qwen models served by Ollama. It tes
 2. Go to **Actions → Qwen end-to-end benchmark → Run workflow**.
 3. Start with a smoke run: set `max_cases_per_model` to `3`, contexts to `512,1024`, input targets to `128,256`, output limits to `32,64`, and repeats to `1`.
 4. For a full run, use the defaults or customize the model list. Include available tags for each quantization you want to compare; confirm model tags in the Ollama library first.
-5. Download the `qwen-benchmark-<run_id>` artifact and open `BENCHMARK_SUMMARY.md`. The JSON summary and raw per-model results are included.
+5. Download `qwen-benchmark-summary-<run_id>` and open `BENCHMARK_SUMMARY.md`. It includes the combined JSON summary, expected model list, and all per-model raw results. Individual model artifacts are also available for debugging.
 
 The full default Cartesian matrix can be expensive. Each matrix combination is repeated (2 by default), and a separate quality suite is also run for each model. Increase workflow timeout or reduce the matrix when needed.
 
@@ -64,7 +75,8 @@ For an optional local GGUF test, install `requirements-llamacpp.txt` in a compat
 
 ## Files
 
-- `.github/workflows/qwen-benchmark.yml` — manual and reusable workflow.
+- `.github/workflows/qwen-benchmark.yml` — dynamic one-model-per-runner matrix and final aggregation.
+- `scripts/build_matrix.py` — validates and expands the comma-separated model list into safe matrix entries.
 - `scripts/bench_ollama.py` — test matrix, API interaction, telemetry and quality checks.
 - `scripts/summarize_results.py` — consolidated Markdown and JSON summary.
 - `scripts/bench_llamacpp.py` + `scripts/prompts.py` — optional local GGUF benchmark backend (not used by the hosted Ollama workflow); install `requirements-llamacpp.txt` first.
