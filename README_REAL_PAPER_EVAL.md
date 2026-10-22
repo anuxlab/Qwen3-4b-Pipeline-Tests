@@ -2,18 +2,31 @@
 
 This workflow evaluates real open-access PDFs with Ollama models. The default is `qwen3:4b-q8_0`; alternatives can be selected from the GitHub Actions form. The repository includes five direct arXiv PDF links in `papers/urls.txt` so the workflow can run without manually uploading papers.
 
-## Why this version uses chunked extraction
+## Why this version uses task-specific extraction
 
-The previous flow sent a large portion of an entire PDF in one request and then ran a second model-judge request. On CPU GitHub-hosted runners, that caused requests to hit the 600-second timeout. This version:
+The previous run downloaded and parsed all five PDFs successfully, but all five model responses failed with `JSONDecodeError: Unterminated string`. The request times were 154–180 seconds, so this was not the configured 300-second timeout. The most likely cause was that the model response was cut off while generating the full JSON object under a 1,024-token output cap.
 
-1. Parses all PDF pages with `pymupdf` (no deprecated `fitz` import).
-2. Preserves one-based PDF page labels and splits the paper into bounded chunks (default 6,000 characters per request).
-3. Makes a separate constrained-JSON extraction request for each chunk, with a 4,096-token context and 1,024-token generation cap by default.
-4. Merges extracted fields and deduplicates list items while preserving each item's page-level evidence.
-5. Validates the merged result against JSON Schema and checks whether each evidence quote occurs on the claimed page.
-6. Skips the extra model-based evidence judge by default. It can be enabled from the workflow input, but it costs more time and is only a screening signal.
+This version changes the extraction contract:
 
-This reduces the size of each request and makes progress visible per chunk. It cannot guarantee that every model call will finish within the timeout; if a call fails, reduce the chunk size to 4,000 characters or use a faster/persistent inference host.
+1. **Metadata pass:** title, authors, year, DOI, abstract, and research problem only.
+2. **Evidence passes:** each page-labelled chunk extracts only datasets, named models/algorithms, metrics/results, and claims with short exact quotes.
+3. **Synthesis pass:** five-point summary, methodology, simulation, contributions, limitations, and future work.
+4. **Bounded retry:** if a response is invalid or incomplete JSON, retry once with a larger token budget and stricter compact-output instructions.
+5. **Merge and validate:** combine task outputs, validate against the final schema, and verify that evidence quotes occur on the cited page.
+
+This avoids asking every chunk to regenerate all paper fields and large arrays. It cannot guarantee inference success on a hosted CPU runner, but it directly addresses the incomplete-JSON failure seen in the uploaded run.
+
+## Recommended initial settings
+
+- Model: `qwen3:4b-q8_0`
+- Papers: `5`
+- Context: `4096`
+- Chunk size: `4000` characters
+- Maximum generated tokens per request: `2048`
+- Request timeout: `600` seconds
+- Evidence judge: disabled
+
+Start with five papers and inspect `paper-evaluation.json` before scaling to 10–20. Every evidence chunk prints progress to the Actions log. The report records per-task latency and token telemetry. The optional evidence-judge pass remains disabled because it adds more inference cost and is not ground truth.
 
 ## Included open-access sample cohort
 
@@ -53,10 +66,10 @@ In another terminal:
 python scripts/paper_eval.py \
   --models qwen3:4b-q8_0 \
   --max-papers 5 \
-  --max-chars 6000 \
+  --max-chars 4000 \
   --num-ctx 4096 \
-  --num-predict 1024 \
-  --timeout 300 \
+  --num-predict 2048 \
+  --timeout 600 \
   --output-dir paper-eval-results
 ```
 
@@ -88,7 +101,7 @@ The extractor returns bibliographic metadata, abstract, a five-point summary, re
 
 ## Troubleshooting
 
-- **Request timeout:** retry with `max_chars=4000`, `num_predict=512` or `1024`, and `num_ctx=4096`. Avoid enabling the evidence judge until extraction succeeds.
+- **Request timeout:** use `max_chars=3000`, `num_predict=2048`, and `num_ctx=4096`; the task-specific schema and compact retry are enabled by default. Avoid enabling the evidence judge until extraction succeeds.
 - **Model pull / runner memory:** Q8 is memory-heavy for a hosted CPU runner. A persistent self-hosted Ollama endpoint may be more practical for repeated 5–20-paper runs.
 - **No PDF inputs:** confirm `papers/urls.txt` is committed and contains direct PDF links or add PDFs under `papers/`.
 - **No extractable text:** the PDF is likely scanned or text extraction is blocked; OCR is not currently bundled.

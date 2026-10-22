@@ -23,21 +23,21 @@ on:
       max_chars:
         description: 'Maximum characters sent per model call; the paper is processed in page-labelled chunks.'
         required: true
-        default: '6000'
+        default: '4000'
         type: choice
-        options: ['4000','6000','8000','10000']
+        options: ['3000','4000','5000','6000']
       num_predict:
         description: 'Maximum generated tokens per chunk response; lower values reduce timeout risk.'
         required: true
-        default: '1024'
+        default: '2048'
         type: choice
-        options: ['512','1024','1536','2048']
+        options: ['1024','1536','2048','3072']
       request_timeout_sec:
         description: 'Timeout per Ollama request in seconds; each bounded request is capped to avoid a single huge call.'
         required: true
-        default: '300'
+        default: '600'
         type: choice
-        options: ['180','300','600','900']
+        options: ['300','600','900','1200']
       judge_evidence:
         description: 'Optional slow second-pass model review of claim support.'
         required: true
@@ -87,6 +87,13 @@ jobs:
             echo 'No PDF inputs found. Add 5–20 PDFs under papers/ or create papers/urls.txt with direct PDF URLs.'
             exit 1
           fi
+      - name: Restore downloaded PDFs and parsed page-text cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            work/downloaded-pdfs/
+            work/text-cache/
+          key: paper-text-${{ runner.os }}-${{ hashFiles('papers/urls.txt', 'requirements-paper-eval.txt') }}-v1
       - name: Restore Ollama model cache
         uses: actions/cache@v4
         with:
@@ -100,6 +107,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$HOME/.ollama/models"
+          if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then
+            echo "Ollama API is already available; reusing it."
+            exit 0
+          fi
           ollama serve > ollama-paper-eval.log 2>&1 &
           for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then exit 0; fi
@@ -148,6 +159,8 @@ jobs:
           name: real-paper-extraction-eval-${{ github.run_id }}
           path: |
             paper-eval-results/
+            work/text-cache/
+            work/downloaded-pdfs/
             ollama-paper-eval.log
           if-no-files-found: warn
           retention-days: 90
